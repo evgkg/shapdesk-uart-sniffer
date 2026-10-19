@@ -14,7 +14,9 @@ The program logs display-height changes, `CTRL_COMMAND` independently on command
 
 `height_cm` follows the displayed value and may briefly differ from physical height during preset activation. Suspected jumps produce `DIAG BEFORE/ANOMALY/AFTER` lines with exact AA/state bytes and all decoded fields. The default heuristic is a height jump of at least 5 cm with raw-position change at most 32, with four preceding and four following valid messages. STATE must have three duplicated pairs, scan `0x60..0x67`/`0x98` and height 50..150 cm; this is a provisional acceptance policy, not measured travel limits. A PRESET_1 (`0x04`) display transient is retained as a candidate separately from the last plausible physical height. Motion uses raw-position changes independently of command. See PROTOCOL.md sections 3.4–3.6 for limits and counters.
 
-UART reception uses an 8192-byte ring and 64-event queue; USB logs go through a separate 64-record queue. Watch `fifo_overflow`, `ring_full`, `frame`, `rx_peak`, `event_peak`, `log_dropped` and `log_max_us` when investigating errors during movement. New transport errors discard partial input and invalidate physical certainty. The latest changes have **not been built or run**, as requested by the user.
+UART reception uses an 8192-byte ring and 64-event queue; USB logs go through a separate 64-record queue. Watch `fifo_overflow`, `ring_full`, `frame`, `rx_peak`, `event_peak`, `log_dropped` and `log_max_us` when investigating errors during movement. New transport errors discard partial input and invalidate physical certainty. The latest rejection diagnostics have passed portable C syntax checks, but the firmware build was blocked by sandbox WinError 5; the requested outside-sandbox run was declined.
+
+`REJECT_COUNTS` distinguishes AA header/checksum refusal, STATE validation, desynchronization runs, internal capacity recovery, offline TX validation and transport partial discards. `REJECT_SAMPLE` prints only the first observed context per reason (up to 13 bytes), at most once while incomplete and once when closed. Samples preserve decision length, stream offset and STATE policy flags; later errors update statistics without replacing samples. Unknown scans remain rejected by the existing provisional policy, but are **not established protocol errors**. See PROTOCOL.md section 3.7 for interpreting `decode_errors` and the 12 skipped bytes after an AA refusal.
 
 ## Wiring — important safety prerequisites
 
@@ -77,6 +79,9 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic \
 cc -std=c11 -Wall -Wextra -Werror -pedantic \
   -I main main/desk_protocol.c main/desk_tracking.c tests/test_tracking.c -o test_tracking
 ./test_tracking
+cc -std=c11 -Wall -Wextra -Werror -pedantic \
+  -I main main/desk_protocol.c tests/test_rejections.c -o test_rejections
+./test_rejections
 ```
 
 The parser is implemented in plain C, independent of ESP-IDF, and rejects frames with invalid checksums or broken duplicated pairs. After stream errors, it scans for the next start byte. `AA` (7 bytes) and status (6 bytes) are handled as one **13-byte parsing unit** because the real captures have them consecutively; this is a convenience for parsing, not an assertion that there is no gap between UART transmissions.

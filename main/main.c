@@ -93,6 +93,8 @@ static void log_task(void *ctx) {
     (void)ctx;
     log_record_t r;
     int64_t log_max_us = 0;
+    bool printed_prefix[DESK_REJECT_REASON_COUNT] = {0};
+    bool printed_complete[DESK_REJECT_REASON_COUNT] = {0};
     while (true) {
         if (xQueueReceive(log_queue, &r, portMAX_DELAY) != pdTRUE) continue;
         int64_t start = esp_timer_get_time();
@@ -126,9 +128,39 @@ static void log_task(void *ctx) {
                     (unsigned long)r.parser.decode_errors, (unsigned long)r.parser.invalid_state,
                     (unsigned long)r.parser.skipped, (unsigned long)s->display_changes,
                     (unsigned long)s->display_transients, (unsigned long)r.anomalies);
+                ESP_LOGI(TAG, "REJECT_COUNTS aa_header=%lu aa_checksum=%lu state_validation=%lu"
+                    " desync_runs=%lu capacity=%lu tx_validation=%lu transport_partial=%lu",
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_AA_HEADER],
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_AA_CHECKSUM],
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_STATE],
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_DESYNC],
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_CAPACITY],
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_TX_VALIDATION],
+                    (unsigned long)r.parser.reject_counts[DESK_REJECT_TRANSPORT_PARTIAL]);
+                for (unsigned i = 0; i < DESK_REJECT_REASON_COUNT; ++i) {
+                    const desk_reject_sample_t *sample = &r.parser.reject_samples[i];
+                    if (!sample->len || (printed_prefix[i] && (!sample->closed || printed_complete[i]))) continue;
+                    char bytes[3 * sizeof(sample->bytes)];
+                    for (unsigned j = 0; j < sample->len; ++j)
+                        snprintf(bytes + 3 * j, sizeof(bytes) - 3 * j, "%02X%s",
+                            (unsigned)sample->bytes[j], j + 1 == sample->len ? "" : " ");
+                    ESP_LOGI(TAG, "REJECT_SAMPLE reason=%s offset=%" PRIu64
+                        " decision_len=%u captured=%u closed=%s state_flags=0x%02X bytes=[%s]",
+                        desk_reject_reason_name((desk_reject_reason_t)i), sample->offset,
+                        (unsigned)sample->decision_len, (unsigned)sample->len,
+                        sample->closed ? "yes" : "no", (unsigned)sample->state_flags, bytes);
+                    if (sample->bytes[0] == 0xAA && sample->len >= 7) {
+                        const uint8_t *a = sample->bytes;
+                        unsigned sum = (uint8_t)(a[1] + a[2] + a[3] + a[4] + a[5]);
+                        ESP_LOGI(TAG, "REJECT_AA header_byte=0x%02X expected_header=0x09 checksum_seen=0x%02X calculated=0x%02X",
+                            (unsigned)a[1], (unsigned)a[6], sum);
+                    }
+                    printed_prefix[i] = true;
+                    if (sample->closed) printed_complete[i] = true;
+                }
                 if (r.parser.invalid_state) {
                     const uint8_t *b = r.parser.last_rejected_state;
-                    ESP_LOGI(TAG, "STATE_REJECT pairs=%lu scan=%lu height=%lu last=[%02X %02X %02X %02X %02X %02X]",
+                    ESP_LOGI(TAG, "STATE_REJECT pairs=%lu scan_policy_unknown=%lu height_policy=%lu last=[%02X %02X %02X %02X %02X %02X]",
                         (unsigned long)r.parser.state_pair_errors, (unsigned long)r.parser.state_scan_errors,
                         (unsigned long)r.parser.state_height_errors, (unsigned)b[0], (unsigned)b[1],
                         (unsigned)b[2], (unsigned)b[3], (unsigned)b[4], (unsigned)b[5]);
@@ -219,7 +251,7 @@ void app_main(void) {
     desk_parser_reset(&incoming_from_controller);
     log_queue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(log_record_t));
     ESP_ERROR_CHECK(log_queue ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(xTaskCreate(log_task, "desk_log", 4096, NULL, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(log_task, "desk_log", 6144, NULL, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_LOGI(TAG, "PASSIVE SNIFFER: 9600 8N1, desk RX -> UART1 GPIO%d", DESK_BOARD_RX_GPIO);
     ESP_LOGW(TAG, "Listen-only. Use safe level translation and a verified ground interface.");
     init_uart_rx_only();

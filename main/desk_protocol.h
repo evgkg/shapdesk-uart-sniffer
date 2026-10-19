@@ -27,6 +27,30 @@ typedef struct {
     uint8_t state[6];
 } desk_event_t;
 
+typedef enum {
+    DESK_REJECT_AA_HEADER,
+    DESK_REJECT_AA_CHECKSUM,
+    DESK_REJECT_STATE,
+    DESK_REJECT_DESYNC,
+    DESK_REJECT_CAPACITY,
+    DESK_REJECT_TX_VALIDATION,
+    DESK_REJECT_TRANSPORT_PARTIAL,
+    DESK_REJECT_REASON_COUNT
+} desk_reject_reason_t;
+
+#define DESK_STATE_BAD_PAIRS 1u
+#define DESK_STATE_UNKNOWN_SCAN_POLICY 2u
+#define DESK_STATE_HEIGHT_POLICY 4u
+
+typedef struct {
+    uint8_t bytes[13]; // observed stream context, not necessarily a whole packet
+    uint8_t len;
+    uint8_t decision_len; // bytes available when the decision was made
+    uint8_t state_flags;
+    bool closed; // full 13-byte context, or truncated at a transport discontinuity
+    uint64_t offset; // 1-based stream byte offset, independent of UART read chunks
+} desk_reject_sample_t;
+
 typedef struct {
     uint8_t buf[13];
     uint8_t len;
@@ -39,11 +63,17 @@ typedef struct {
     uint32_t state_scan_errors;
     uint32_t state_height_errors;
     uint8_t last_rejected_state[6];
+    uint32_t reject_counts[DESK_REJECT_REASON_COUNT];
+    // One first example per reason per parser reset; bounded memory and logging.
+    desk_reject_sample_t reject_samples[DESK_REJECT_REASON_COUNT];
+    uint64_t bytes_fed;
+    bool desync_active;
 } desk_parser_t;
 
 void desk_parser_reset(desk_parser_t *parser);
 // Discard partial bytes after transport loss, preserving cumulative counters.
 void desk_parser_discard_partial(desk_parser_t *parser);
+const char *desk_reject_reason_name(desk_reject_reason_t reason);
 // Each feed returns at most one event. Separate parsers per physical UART.
 bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event);
 bool desk_feed_tx(desk_parser_t *parser, uint8_t byte, desk_event_t *event);
