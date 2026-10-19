@@ -15,10 +15,12 @@ typedef enum {
 typedef struct {
     desk_event_type_t type;
     uint16_t position_raw;
-    uint8_t height_cm;     // valid for DESK_EVENT_RX_STATE
+    uint8_t height_cm;     // displayed cm; may transiently differ from physical height
     uint8_t button;        // DESK_EVENT_TX_BUTTON, or AA byte[4] for RX_STATE
     uint8_t scan_code;     // repeated first two bytes of RX state group
     uint8_t mode;          // repeated middle two bytes of RX state group
+    uint8_t aa[7];         // exact validated RX bytes, not reconstructed
+    uint8_t state[6];
 } desk_event_t;
 
 typedef struct {

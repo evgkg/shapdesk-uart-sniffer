@@ -1,3 +1,3 @@
-idf_component_register(SRCS "main.c" "desk_protocol.c"
+idf_component_register(SRCS "main.c" "desk_protocol.c" "desk_diagnostics.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_driver_uart esp_timer)

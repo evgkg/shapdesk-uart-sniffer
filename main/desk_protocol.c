@@ -58,6 +58,8 @@ bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
             .scan_code = s[0],
             .mode = s[2],
         };
+        memcpy(event->aa, parser->buf, sizeof(event->aa));
+        memcpy(event->state, s, sizeof(event->state));
         ++parser->good;
         discard_prefix(parser, 13);
         return true;

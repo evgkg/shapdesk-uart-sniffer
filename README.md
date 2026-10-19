@@ -10,7 +10,9 @@ The documented UART interface uses **9600 baud, 8N1, non-inverted**. UART port n
 - **Desk TX pad (light blue):** leave disconnected in this version. Its `BB` position updates and `D8` button states are not monitored; the reusable parser still supports these formats for offline tests.
 - Only **UART1 RX GPIO4** is initialized. No TX GPIO is assigned and no UART transmission API is called. ESP32-C3 has no UART2.
 
-The program logs height **only when it changes** and a status heartbeat every 5 seconds. The `RX live=no (stale)` indicator means it hasn't received a valid AA+status for >1 second. The raw AA command field is logged with height changes; it is not a complete handset button decoder.
+The program logs height **only when it changes**, `CTRL_COMMAND` independently on command changes, and a status heartbeat every 5 seconds. The `RX live=no (stale)` indicator means it hasn't received a valid AA+status for >1 second. STATUS includes the last command, parser `invalid`/`skipped` counters and diagnostic anomaly count. The raw AA command field is not a complete handset button decoder.
+
+`height_cm` follows the displayed value and may briefly differ from physical height during preset activation. Suspected jumps produce `DIAG BEFORE/ANOMALY/AFTER` lines with exact AA/state bytes and all decoded fields. The default heuristic is a height jump of at least 5 cm with raw-position change at most 32, with four preceding and four following valid messages. See PROTOCOL.md section 3.4 for limits and interpretation; the firmware does not classify the transient value as a target or suppress it.
 
 ## Wiring — important safety prerequisites
 
@@ -66,6 +68,9 @@ Without a signal, `STATUS` reports zero good frames. If the desk screen is aslee
 cc -std=c11 -Wall -Wextra -Werror -pedantic \
   -I main main/desk_protocol.c tests/test_parser.c -o test_parser
 ./test_parser
+cc -std=c11 -Wall -Wextra -Werror -pedantic \
+  -I main main/desk_protocol.c main/desk_diagnostics.c tests/test_diagnostics.c -o test_diagnostics
+./test_diagnostics
 ```
 
 The parser is implemented in plain C, independent of ESP-IDF, and rejects frames with invalid checksums or broken duplicated pairs. After stream errors, it scans for the next start byte. `AA` (7 bytes) and status (6 bytes) are handled as one **13-byte parsing unit** because the real captures have them consecutively; this is a convenience for parsing, not an assertion that there is no gap between UART transmissions.

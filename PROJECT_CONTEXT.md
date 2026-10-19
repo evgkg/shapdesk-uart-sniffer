@@ -92,6 +92,14 @@ Use their code and documentation only after checking their licenses and comparin
 
 After each substantial implementation/experiment, append a concise **dated** note here with: verified result, evidence (capture or command output), changed files, remaining unknowns. Keep `PROTOCOL.md` as the technical packet reference. Avoid pasting the entire chat or long build logs.
 
+## 2026-10-19 — Preset display transient diagnostics
+
+- User-reported observation: `(height_cm, position_raw)` changes `(109,6026) -> (68,6032) -> (108,6018)`, then decreases toward `(67,4426)` on preset recall; stock display briefly shows 68. Raw capture and command/scan/mode values for this episode were not supplied. Treat height as displayed cm, not always physical height. Meaning of 68 as a target remains a hypothesis.
+- `desk_protocol.c/.h` now preserve exact validated AA/state bytes in each RX event. New portable `desk_diagnostics.c/.h` detect heuristic jumps (height delta >=5, raw delta <=32), retain four previous samples, emit four following samples and extend overlapping windows. Comparisons reset after >1 s without a valid sample. No conversion, filtering or motion logic was added.
+- `main.c` logs full diagnostic samples, command changes independently of height, and STATUS command/invalid/skipped/anomaly counters. UART1 RX GPIO4 and USB console are unchanged; no device flashing, UART transmission or wiring changes performed.
+- Added synthetic tests for 109->68->108, exact byte retention, ring wrap/order, overlapping windows, ordinary motion and stale gaps. Command/scan/mode fixture values are invented test inputs, not protocol findings. Updated component sources and README test instructions; PROTOCOL.md section 3.4 separates observation from hypothesis.
+- Verification: ESP clang compiled both portable test programs with C11 and strict warnings, but produced RISC-V binaries that cannot run on this Windows host; tests are not claimed passed. `idf.py build` with the installed ESP-IDF 6.1 profile was blocked before CMake startup by sandbox WinError 5; the outside-sandbox request was rejected. The earlier successful user build predates this diagnostic change. New firmware build and runtime verification remain pending.
+
 ## 2026-10-19 ? ESP32-C3 single-line adaptation
 
 - Observed in this checkout: local configuration already selected `esp32c3`, but `main/main.c` still initialized S3-style UART1 and UART2. Removed the second UART, panel state handling and TX-line logs. Only UART1 RX on GPIO4 at 9600 8N1 is initialized; no desk TX pin is assigned and no commands are sent.
