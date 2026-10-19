@@ -22,7 +22,6 @@
 static const char *TAG = "shapdesk";
 static desk_parser_t incoming_from_controller;
 static desk_diagnostics_t diagnostics;
-
 #define RX_RING_SIZE 8192
 #define UART_EVENT_QUEUE_SIZE 64
 #define LOG_QUEUE_SIZE 64
@@ -83,10 +82,10 @@ static void log_diagnostic(desk_diag_kind_t kind, const desk_diag_sample_t *samp
     const char *label = kind == DESK_DIAG_BEFORE ? "BEFORE" :
                         kind == DESK_DIAG_ANOMALY ? "ANOMALY" : "AFTER";
     ESP_LOGI(TAG, "DIAG %s seq=%" PRIu32 " rx_us=%" PRId64
-             " position_raw=%u height_cm=%u button=0x%02X scan_code=0x%02X mode=0x%02X"
+             " position_raw=%u height_cm=%u button=0x%02X aa_byte5=0x%02X scan_code=0x%02X mode=0x%02X"
              " | AA=[%s] STATE=[%s]", label, sample->sequence, sample->time_us,
              (unsigned)ev->position_raw, (unsigned)ev->height_cm,
-             (unsigned)ev->button, (unsigned)ev->scan_code, (unsigned)ev->mode, aa, state);
+             (unsigned)ev->button, (unsigned)ev->aa_byte5, (unsigned)ev->scan_code, (unsigned)ev->mode, aa, state);
 }
 
 static void log_task(void *ctx) {
@@ -151,9 +150,9 @@ static void log_task(void *ctx) {
                         sample->closed ? "yes" : "no", (unsigned)sample->state_flags, bytes);
                     if (sample->bytes[0] == 0xAA && sample->len >= 7) {
                         const uint8_t *a = sample->bytes;
-                        unsigned sum = (uint8_t)(a[1] + a[2] + a[3] + a[4] + a[5]);
-                        ESP_LOGI(TAG, "REJECT_AA header_byte=0x%02X expected_header=0x09 checksum_seen=0x%02X calculated=0x%02X",
-                            (unsigned)a[1], (unsigned)a[6], sum);
+                        unsigned sum = desk_aa_checksum(a);
+                        ESP_LOGI(TAG, "REJECT_AA header_byte=0x%02X expected_header=0x09 byte5=0x%02X checksum_seen=0x%02X calculated=0x%02X",
+                            (unsigned)a[1], (unsigned)a[5], (unsigned)a[6], sum);
                     }
                     printed_prefix[i] = true;
                     if (sample->closed) printed_complete[i] = true;

@@ -53,7 +53,7 @@ AA 09 12 B6 00 00 D1    60 60 03 03 4D 4D
 AA 09 14 BD 00 00 DA    62 62 00 00 5A 5A
 ```
 
-- For the seven-byte packet, the last byte matches the sum of bytes 1 through 5 after `AA` modulo 256; e.g. `09 + 12 + B6 + 00 + 00 = D1` modulo 256.
+- Historical AA examples match the sum of bytes at offsets 1..5 modulo 256, but offset 5 was zero and its inclusion was not distinguishable. New `AA 09 11 E6 02 01 02` and the subsequent 1227-AA experiment confirm offsets 1..4. Offset 5 is excluded from checksum; its meaning remains unknown. See the checksum fix update below.
 - Two-byte field in `AA` (e.g. `12 B6`) changes with position. The button/activity field (e.g. `00` vs `02`) changes during up; more mapping needed.
 - A **separate six-byte group** follows, whose first duplicated byte can cycle among `60,61,62,63,64,65,66,67,98`; purpose unknown. The duplicated middle byte (`00` / `03`) changes with state; do not call it simply 'motor moving' without confirmation.
 - Last duplicated state byte directly matches display centimetres in observed captures: `43 43` (67), `4D 4D` (77), `5A 5A` (90). A capture raising from ~67 cm ended with exactly **77** on the physical display; another at **90** yielded stable `5A 5A`. This is the strongest confirmed decoding result.
@@ -91,6 +91,14 @@ Use their code and documentation only after checking their licenses and comparin
 ## Update protocol
 
 After each substantial implementation/experiment, append a concise **dated** note here with: verified result, evidence (capture or command output), changed files, remaining unknowns. Keep `PROTOCOL.md` as the technical packet reference. Avoid pasting the entire chat or long build logs.
+
+## 2026-10-19 — AA sixth-byte checksum hypothesis
+
+- User supplied rejected `AA 09 11 E6 02 01 02`: observed sum with offset 5 is 03; excluding it is 02, matching the wire. Older documented examples all have offset 5 = 00 and cannot distinguish the formulas. User reports 63 checksum refusals, skipped 762 (=63*12+6), no other packet refusal causes or hardware UART errors. Only one new raw AA is available; the other refusals and extra six skipped bytes are not explained conclusively.
+- Decision: diagnostic-only, retain historical acceptance sum over offsets 1..5 until more nonzero-offset-5 samples discriminate coverage. Do not accept either formula opportunistically. Offset 5 remains unknown, not a proven motion/state flag. PROTOCOL.md 3.1 now lists every AA byte and explicitly qualifies checksum coverage.
+- Added both checksum helpers, per-value (all 256) seen/match-with/match-without histogram and total counts before checksum/STATE validation, counted once per AA09 stream offset. External static stats avoid copying the 3 KiB histogram in log records. Periodic AA_SUM and at most 8 rotating AA_SUM_BYTE5 rows; bounded REJECT_AA examples show both sums and matches. No height/preset/motion logic changed.
+- Added tests/test_checksum.c for three old examples, the exact new seven-byte observation (still rejected in diagnostic mode), synthetic following STATE, acceptance of historical formula, both/neither matches, modulo overflow, all 256 byte values and deduplication while awaiting STATE. Portable strict C11 syntax checks pass for all five test sources; tests not executed on this Windows host.
+- Observed successful `idf.py build` (exit 0, "Project build complete") on ESP-IDF v6.1, target esp32c3, after approved outside-sandbox execution. Generated build/shapdesk_uart_sniffer.bin size 0x2C050 (180304) bytes; app partition 83% free. IDF Kconfig/dependency warnings did not prevent compilation/linking. This supersedes prior blocked build status; new checksum diagnostics still need runtime verification. No flashing or UART transmission.
 
 ## 2026-10-19 — AA rejection classification and bounded raw evidence
 
@@ -130,3 +138,10 @@ After each substantial implementation/experiment, append a concise **dated** not
 - Device detection on COM3 reports ESP32-C3 revision v0.4, embedded 4 MB flash and native USB Serial/JTAG. No device identifiers are retained here.
 - The extension reports `Flash Done`, but detailed flash write/verification output is absent from the supplied text. No runtime monitor output was supplied; successful boot, USB application logs and live desk decoding remain unverified. The agent did not flash or send UART commands.
 - Kconfig and component dependency warnings shown originate in ESP-IDF components and did not prevent this build. Next verification: inspect ESP-IDF Monitor output for the passive sniffer startup and five-second STATUS logs.
+
+## 2026-10-19 - Confirmed AA checksum correction
+
+- User-reported evidence: of 1227 AA, 1165 match the old offsets-1..5 sum and all 1227 match offsets 1..4; all 62 old rejections have offset 5 = 01; UART-driver errors zero. This supersedes the diagnostic-only decision above. Confirmed checksum for the observed protocol is `(aa[1]+aa[2]+aa[3]+aa[4]) & 0xFF`.
+- Parser now uses only corrected desk_aa_checksum. Offset 5 is exposed as aa_byte5 with unknown semantics and retained in raw AA; DIAG logs it. Removed temporary two-formula helpers, external histogram, AA_SUM/AA_SUM_BYTE5 snapshots and logs. Bounded refusal logs retain one calculated checksum. Height/preset/motion modules are unchanged.
+- Replaced tests/test_checksum.c with acceptance tests for byte5=00/01 (exact reported AA plus synthetic STATE), all 256 unknown-field values, modulo wrap, refusal of the old sum, recovery and unchanged STATE validation. Strict C11 syntax checks pass for portable code and five test sources; tests were not executed on a host CPU.
+- Observed: idf.py build succeeded (exit 0, Project build complete), ESP-IDF v6.1, esp32c3, after approved outside-sandbox run. Binary build/shapdesk_uart_sniffer.bin is 0x2BD00 (179456) bytes; app partition 83% free. No flashing or UART transmission performed; new binary runtime remains to be checked.

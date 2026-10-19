@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+uint8_t desk_aa_checksum(const uint8_t aa[7]) {
+    return (uint8_t)(aa[1] + aa[2] + aa[3] + aa[4]);
+}
+
 const char *desk_reject_reason_name(desk_reject_reason_t reason) {
     static const char *const names[] = {"AA_HEADER", "AA_CHECKSUM", "STATE_VALIDATION",
         "DESYNCHRONIZATION", "PARSER_CAPACITY", "TX_VALIDATION", "TRANSPORT_PARTIAL"};
@@ -84,7 +88,7 @@ bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
         parser->desync_active = false;
         if (parser->len < 7) return false;
         const uint8_t *aa = parser->buf;
-        const uint8_t checksum = (uint8_t)(aa[1] + aa[2] + aa[3] + aa[4] + aa[5]);
+        const uint8_t checksum = desk_aa_checksum(aa);
         if (aa[1] != 0x09 || checksum != aa[6]) {
             record_reject(parser, aa[1] != 0x09 ? DESK_REJECT_AA_HEADER : DESK_REJECT_AA_CHECKSUM, 0);
             discard_prefix(parser, 1);
@@ -117,6 +121,7 @@ bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
             .position_raw = (uint16_t)((parser->buf[2] << 8) | parser->buf[3]),
             .height_cm = s[4],
             .button = parser->buf[4],
+            .aa_byte5 = parser->buf[5],
             .scan_code = s[0],
             .mode = s[2],
         };
