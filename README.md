@@ -10,9 +10,11 @@ The documented UART interface uses **9600 baud, 8N1, non-inverted**. UART port n
 - **Desk TX pad (light blue):** leave disconnected in this version. Its `BB` position updates and `D8` button states are not monitored; the reusable parser still supports these formats for offline tests.
 - Only **UART1 RX GPIO4** is initialized. No TX GPIO is assigned and no UART transmission API is called. ESP32-C3 has no UART2.
 
-The program logs height **only when it changes**, `CTRL_COMMAND` independently on command changes, and a status heartbeat every 5 seconds. The `RX live=no (stale)` indicator means it hasn't received a valid AA+status for >1 second. STATUS includes the last command, parser `invalid`/`skipped` counters and diagnostic anomaly count. The raw AA command field is not a complete handset button decoder.
+The program logs display-height changes, `CTRL_COMMAND` independently on command changes, raw-motion transitions, and a status heartbeat every 5 seconds. `RX_live=no` means no current valid observation. STATUS separates `display`, inferred `current` (with a `held` flag) and `preset_target_candidate`. PARSER and UART lines separate decode errors, invalid STATE, valid display transitions and transport/logging overload. The raw AA command field is not a complete handset button decoder.
 
-`height_cm` follows the displayed value and may briefly differ from physical height during preset activation. Suspected jumps produce `DIAG BEFORE/ANOMALY/AFTER` lines with exact AA/state bytes and all decoded fields. The default heuristic is a height jump of at least 5 cm with raw-position change at most 32, with four preceding and four following valid messages. See PROTOCOL.md section 3.4 for limits and interpretation; the firmware does not classify the transient value as a target or suppress it.
+`height_cm` follows the displayed value and may briefly differ from physical height during preset activation. Suspected jumps produce `DIAG BEFORE/ANOMALY/AFTER` lines with exact AA/state bytes and all decoded fields. The default heuristic is a height jump of at least 5 cm with raw-position change at most 32, with four preceding and four following valid messages. STATE must have three duplicated pairs, scan `0x60..0x67`/`0x98` and height 50..150 cm; this is a provisional acceptance policy, not measured travel limits. A PRESET_1 (`0x04`) display transient is retained as a candidate separately from the last plausible physical height. Motion uses raw-position changes independently of command. See PROTOCOL.md sections 3.4–3.6 for limits and counters.
+
+UART reception uses an 8192-byte ring and 64-event queue; USB logs go through a separate 64-record queue. Watch `fifo_overflow`, `ring_full`, `frame`, `rx_peak`, `event_peak`, `log_dropped` and `log_max_us` when investigating errors during movement. New transport errors discard partial input and invalidate physical certainty. The latest changes have **not been built or run**, as requested by the user.
 
 ## Wiring — important safety prerequisites
 
@@ -56,8 +58,9 @@ Use the board connector wired to native USB (C3 GPIO18 = D?, GPIO19 = D+); leave
 
 ```text
 I (...) shapdesk: PASSIVE SNIFFER: 9600 8N1, desk RX -> UART1 GPIO4
-I (...) shapdesk: HEIGHT 90 cm | raw=5309 | ctrl_command=0x00 | mode=0x00
-I (...) shapdesk: STATUS height=90 cm | RX AA+state=... invalid=0 | RX live=yes
+I (...) shapdesk: CTRL_COMMAND 0x00
+I (...) shapdesk: HEIGHT display=90 current=90 held=no preset_target_candidate=unknown raw=5309
+I (...) shapdesk: STATUS display=90 current=90 held=no preset_target_candidate=unknown ctrl_command=0x00 raw=5309 moving=no direction=0 RX_live=yes
 ```
 
 Without a signal, `STATUS` reports zero good frames. If the desk screen is asleep, this firmware may still receive AA status; that hasn't been verified across every state.
@@ -71,6 +74,9 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic \
 cc -std=c11 -Wall -Wextra -Werror -pedantic \
   -I main main/desk_protocol.c main/desk_diagnostics.c tests/test_diagnostics.c -o test_diagnostics
 ./test_diagnostics
+cc -std=c11 -Wall -Wextra -Werror -pedantic \
+  -I main main/desk_protocol.c main/desk_tracking.c tests/test_tracking.c -o test_tracking
+./test_tracking
 ```
 
 The parser is implemented in plain C, independent of ESP-IDF, and rejects frames with invalid checksums or broken duplicated pairs. After stream errors, it scans for the next start byte. `AA` (7 bytes) and status (6 bytes) are handled as one **13-byte parsing unit** because the real captures have them consecutively; this is a convenience for parsing, not an assertion that there is no gap between UART transmissions.

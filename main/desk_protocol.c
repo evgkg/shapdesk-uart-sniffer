@@ -6,6 +6,11 @@ void desk_parser_reset(desk_parser_t *parser) {
     memset(parser, 0, sizeof(*parser));
 }
 
+void desk_parser_discard_partial(desk_parser_t *parser) {
+    parser->skipped += parser->len;
+    parser->len = 0;
+}
+
 static void discard_prefix(desk_parser_t *parser, size_t n) {
     if (n >= parser->len) {
         parser->len = 0;
@@ -19,6 +24,7 @@ static void push(desk_parser_t *parser, uint8_t byte) {
     if (parser->len == sizeof(parser->buf)) {
         discard_prefix(parser, 1);
         ++parser->invalid;
+        ++parser->decode_errors;
     }
     parser->buf[parser->len++] = byte;
 }
@@ -40,14 +46,23 @@ bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
         if (!valid_aa(parser->buf)) {
             discard_prefix(parser, 1);
             ++parser->invalid;
+            ++parser->decode_errors;
             continue;
         }
         if (parser->len < 13) return false;
         const uint8_t *s = parser->buf + 7;
-        if (s[0] != s[1] || s[2] != s[3] || s[4] != s[5]) {
+        const bool scan_ok = (s[0] >= 0x60 && s[0] <= 0x67) || s[0] == 0x98;
+        const bool pairs_ok = s[0] == s[1] && s[2] == s[3] && s[4] == s[5];
+        const bool height_ok = s[4] >= DESK_DISPLAY_MIN_CM && s[4] <= DESK_DISPLAY_MAX_CM;
+        if (!pairs_ok || !scan_ok || !height_ok) {
+            memcpy(parser->last_rejected_state, s, sizeof(parser->last_rejected_state));
+            if (!pairs_ok) ++parser->state_pair_errors;
+            if (!scan_ok) ++parser->state_scan_errors;
+            if (!height_ok) ++parser->state_height_errors;
             // Another AA could have started after the first; preserve it.
             discard_prefix(parser, 1);
             ++parser->invalid;
+            ++parser->invalid_state;
             continue;
         }
         *event = (desk_event_t){
@@ -101,6 +116,7 @@ bool desk_feed_tx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
         } else {
             discard_prefix(parser, 1);
             ++parser->invalid;
+            ++parser->decode_errors;
             continue;
         }
         ++parser->good;

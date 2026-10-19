@@ -9,9 +9,11 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "desk_protocol.h"
 #include "desk_diagnostics.h"
+#include "desk_tracking.h"
 
 // Receive-only desk tap. Native USB Serial/JTAG uses GPIO18/19 on ESP32-C3.
 #define DESK_BOARD_RX_GPIO 4  // Shapdesk pad RX (yellow), through safe level translation
@@ -21,16 +23,48 @@ static const char *TAG = "shapdesk";
 static desk_parser_t incoming_from_controller;
 static desk_diagnostics_t diagnostics;
 
+#define RX_RING_SIZE 8192
+#define UART_EVENT_QUEUE_SIZE 64
+#define LOG_QUEUE_SIZE 64
+
+static QueueHandle_t uart_events;
+static QueueHandle_t log_queue;
+static desk_tracking_t desk;
+
 typedef struct {
-    bool height_known;
-    uint8_t height_cm;
-    uint16_t controller_position;
-    uint8_t controller_button;
-    uint8_t scan_code;
-    uint8_t mode;
-    int64_t last_rx_us;
-} desk_state_t;
-static desk_state_t desk;
+    uint32_t bytes, fifo_overflow, ring_full, frame_errors, parity_errors, breaks;
+    uint32_t read_errors, log_dropped, event_queue_full_polls;
+    uint32_t recovery_flushes, recovery_discarded_bytes;
+    size_t rx_peak;
+    UBaseType_t event_peak, log_peak;
+    int64_t read_gap_max_us;
+} transport_stats_t;
+static transport_stats_t transport;
+
+typedef enum { LOG_DIAG, LOG_CHANGE, LOG_STATUS } log_kind_t;
+typedef struct {
+    log_kind_t kind;
+    desk_diag_kind_t diag_kind;
+    desk_diag_sample_t sample;
+    desk_tracking_t state;
+    desk_parser_t parser;
+    transport_stats_t transport;
+    uint32_t anomalies;
+    bool command_changed, display_changed, motion_changed;
+} log_record_t;
+
+static void enqueue_log(const log_record_t *record) {
+    if (xQueueSend(log_queue, record, 0) != pdTRUE) ++transport.log_dropped;
+    UBaseType_t used = uxQueueMessagesWaiting(log_queue);
+    if (used > transport.log_peak) transport.log_peak = used;
+}
+
+static void queue_diagnostic(desk_diag_kind_t kind, const desk_diag_sample_t *sample,
+                             void *ctx) {
+    (void)ctx;
+    log_record_t record = {.kind = LOG_DIAG, .diag_kind = kind, .sample = *sample};
+    enqueue_log(&record);
+}
 
 static void log_diagnostic(desk_diag_kind_t kind, const desk_diag_sample_t *sample,
                            void *ctx) {
@@ -55,28 +89,118 @@ static void log_diagnostic(desk_diag_kind_t kind, const desk_diag_sample_t *samp
              (unsigned)ev->button, (unsigned)ev->scan_code, (unsigned)ev->mode, aa, state);
 }
 
-static void handle_rx(const desk_event_t *ev) {
-    desk.last_rx_us = esp_timer_get_time();
-    bool change = !desk.height_known || desk.height_cm != ev->height_cm;
-    if (!desk.height_known || desk.controller_button != ev->button) {
-        ESP_LOGI(TAG, "CTRL_COMMAND 0x%02X | raw=%u | height_cm=%u",
-                 (unsigned)ev->button, (unsigned)ev->position_raw, (unsigned)ev->height_cm);
-    }
-    desk_diagnostics_feed(&diagnostics, ev, desk.last_rx_us, log_diagnostic, NULL);
-    desk.height_cm = ev->height_cm;
-    desk.height_known = true;
-    desk.controller_position = ev->position_raw;
-    desk.controller_button = ev->button;
-    desk.scan_code = ev->scan_code;
-    desk.mode = ev->mode;
-    if (change) {
-        ESP_LOGI(TAG, "HEIGHT %u cm | raw=%u | ctrl_command=0x%02X | mode=0x%02X",
-                 (unsigned)ev->height_cm, (unsigned)ev->position_raw,
-                 (unsigned)ev->button, (unsigned)ev->mode);
+static void log_task(void *ctx) {
+    (void)ctx;
+    log_record_t r;
+    int64_t log_max_us = 0;
+    while (true) {
+        if (xQueueReceive(log_queue, &r, portMAX_DELAY) != pdTRUE) continue;
+        int64_t start = esp_timer_get_time();
+        if (r.kind == LOG_DIAG) {
+            log_diagnostic(r.diag_kind, &r.sample, NULL);
+        } else {
+            const desk_tracking_t *s = &r.state;
+            char display[12] = "unknown", current[12] = "unknown", candidate[12] = "unknown";
+            char command[12] = "unknown";
+            if (s->known) {
+                snprintf(display, sizeof(display), "%u", (unsigned)s->display_height);
+                snprintf(command, sizeof(command), "0x%02X", (unsigned)s->ctrl_command);
+            }
+            if (s->current_known) snprintf(current, sizeof(current), "%u", (unsigned)s->current_height);
+            if (s->candidate_known) snprintf(candidate, sizeof(candidate), "%u", (unsigned)s->preset_target_candidate);
+            if (r.kind == LOG_CHANGE) {
+                if (r.command_changed) ESP_LOGI(TAG, "CTRL_COMMAND %s", command);
+                if (r.motion_changed) ESP_LOGI(TAG, "MOTION raw_active=%s direction=%d raw=%u",
+                    s->moving ? "yes" : "no", s->motion_direction, (unsigned)s->position_raw);
+                if (r.display_changed) ESP_LOGI(TAG,
+                    "HEIGHT display=%s current=%s held=%s preset_target_candidate=%s raw=%u",
+                    display, current, s->current_held ? "yes" : "no", candidate, (unsigned)s->position_raw);
+            } else {
+                ESP_LOGI(TAG, "STATUS display=%s current=%s held=%s preset_target_candidate=%s ctrl_command=%s"
+                    " raw=%u moving=%s direction=%d RX_live=%s", display, current,
+                    s->current_held ? "yes" : "no", candidate, command, (unsigned)s->position_raw,
+                    s->moving ? "yes" : "no", s->motion_direction, s->known ? "yes" : "no");
+                ESP_LOGI(TAG, "PARSER good=%lu invalid=%lu decode_errors=%lu invalid_state=%lu skipped=%lu"
+                    " display_changes=%lu display_transients=%lu anomalies=%lu",
+                    (unsigned long)r.parser.good, (unsigned long)r.parser.invalid,
+                    (unsigned long)r.parser.decode_errors, (unsigned long)r.parser.invalid_state,
+                    (unsigned long)r.parser.skipped, (unsigned long)s->display_changes,
+                    (unsigned long)s->display_transients, (unsigned long)r.anomalies);
+                if (r.parser.invalid_state) {
+                    const uint8_t *b = r.parser.last_rejected_state;
+                    ESP_LOGI(TAG, "STATE_REJECT pairs=%lu scan=%lu height=%lu last=[%02X %02X %02X %02X %02X %02X]",
+                        (unsigned long)r.parser.state_pair_errors, (unsigned long)r.parser.state_scan_errors,
+                        (unsigned long)r.parser.state_height_errors, (unsigned)b[0], (unsigned)b[1],
+                        (unsigned)b[2], (unsigned)b[3], (unsigned)b[4], (unsigned)b[5]);
+                }
+                ESP_LOGI(TAG, "UART bytes=%lu fifo_overflow=%lu ring_full=%lu frame=%lu parity=%lu break=%lu"
+                    " read_errors=%lu rx_peak=%u/%u event_peak=%u/%u event_queue_full_polls=%lu"
+                    " recovery_flushes=%lu discarded=%lu read_gap_max_us=%" PRId64
+                    " log_dropped=%lu log_peak=%u/%u log_max_us=%" PRId64,
+                    (unsigned long)r.transport.bytes, (unsigned long)r.transport.fifo_overflow,
+                    (unsigned long)r.transport.ring_full, (unsigned long)r.transport.frame_errors,
+                    (unsigned long)r.transport.parity_errors, (unsigned long)r.transport.breaks,
+                    (unsigned long)r.transport.read_errors, (unsigned)r.transport.rx_peak, (unsigned)RX_RING_SIZE,
+                    (unsigned)r.transport.event_peak, (unsigned)UART_EVENT_QUEUE_SIZE,
+                    (unsigned long)r.transport.event_queue_full_polls,
+                    (unsigned long)r.transport.recovery_flushes, (unsigned long)r.transport.recovery_discarded_bytes,
+                    r.transport.read_gap_max_us,
+                    (unsigned long)r.transport.log_dropped, (unsigned)r.transport.log_peak, (unsigned)LOG_QUEUE_SIZE, log_max_us);
+            }
+        }
+        int64_t elapsed = esp_timer_get_time() - start;
+        if (elapsed > log_max_us) log_max_us = elapsed;
     }
 }
 
-static void init_uart_rx_only(uart_port_t port, int gpio) {
+static void handle_rx(const desk_event_t *ev) {
+    int64_t now = esp_timer_get_time();
+    desk_tracking_t prev = desk;
+    desk_tracking_feed(&desk, ev, now);
+    desk_diagnostics_feed(&diagnostics, ev, now, queue_diagnostic, NULL);
+    log_record_t r = {.kind = LOG_CHANGE, .state = desk,
+        .command_changed = !prev.known || prev.ctrl_command != desk.ctrl_command,
+        .display_changed = !prev.known || prev.display_height != desk.display_height ||
+                           prev.current_held != desk.current_held,
+        .motion_changed = prev.moving != desk.moving || prev.motion_direction != desk.motion_direction};
+    if (r.command_changed || r.display_changed || r.motion_changed) enqueue_log(&r);
+}
+
+static void transport_discontinuity(void) {
+    desk_parser_discard_partial(&incoming_from_controller);
+    desk_tracking_discontinuity(&desk);
+    diagnostics.count = diagnostics.next = diagnostics.following = 0;
+}
+
+static bool poll_uart_events(void) {
+    UBaseType_t used = uxQueueMessagesWaiting(uart_events);
+    if (used > transport.event_peak) transport.event_peak = used;
+    if (used == UART_EVENT_QUEUE_SIZE) ++transport.event_queue_full_polls;
+    uart_event_t event;
+    bool lost = false;
+    while (xQueueReceive(uart_events, &event, 0) == pdTRUE) {
+        switch (event.type) {
+            case UART_FIFO_OVF: ++transport.fifo_overflow; lost = true; break;
+            case UART_BUFFER_FULL: ++transport.ring_full; lost = true; break;
+            case UART_FRAME_ERR: ++transport.frame_errors; lost = true; break;
+            case UART_PARITY_ERR: ++transport.parity_errors; lost = true; break;
+            case UART_BREAK: ++transport.breaks; lost = true; break;
+            default: break; // DATA bytes are read directly from the driver ring.
+        }
+    }
+    if (lost) {
+        // Discard bytes across an unknown gap rather than combine old/new fragments.
+        size_t discarded = 0;
+        ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM_1, &discarded));
+        ++transport.recovery_flushes;
+        transport.recovery_discarded_bytes += (uint32_t)discarded;
+        ESP_ERROR_CHECK(uart_flush_input(UART_NUM_1));
+        transport_discontinuity();
+    }
+    return lost;
+}
+
+static void init_uart_rx_only(void) {
     const uart_config_t settings = {
         .baud_rate = DESK_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -84,55 +208,53 @@ static void init_uart_rx_only(uart_port_t port, int gpio) {
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
-    ESP_ERROR_CHECK(uart_param_config(port, &settings));
-    // UART TX is NOT routed to any GPIO. No uart_write_bytes anywhere.
-    ESP_ERROR_CHECK(uart_set_pin(port, UART_PIN_NO_CHANGE, gpio,
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &settings));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, UART_PIN_NO_CHANGE, DESK_BOARD_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(port, 2048, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, RX_RING_SIZE, 0,
+                                        UART_EVENT_QUEUE_SIZE, &uart_events, 0));
 }
 
 void app_main(void) {
     desk_parser_reset(&incoming_from_controller);
-    init_uart_rx_only(UART_NUM_1, DESK_BOARD_RX_GPIO);
-    ESP_LOGI(TAG, "PASSIVE SNIFFER: 9600 8N1, desk RX -> UART1 GPIO%d",
-             DESK_BOARD_RX_GPIO);
-    ESP_LOGW(TAG, "Listen-only. NEVER attach desk UART directly to ESP32 GPIO without safe level shifting.");
-
+    log_queue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(log_record_t));
+    ESP_ERROR_CHECK(log_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(log_task, "desk_log", 4096, NULL, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_LOGI(TAG, "PASSIVE SNIFFER: 9600 8N1, desk RX -> UART1 GPIO%d", DESK_BOARD_RX_GPIO);
+    ESP_LOGW(TAG, "Listen-only. Use safe level translation and a verified ground interface.");
+    init_uart_rx_only();
     uint8_t rx_buf[256];
     desk_event_t ev;
-    int64_t last_report = esp_timer_get_time();
+    int64_t last_report = esp_timer_get_time(), last_read = last_report;
     while (true) {
-        int n = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(10));
-        for (int i = 0; i < n; ++i) {
-            if (desk_feed_rx(&incoming_from_controller, rx_buf[i], &ev)) {
-                handle_rx(&ev);
-            }
-        }
         int64_t now = esp_timer_get_time();
+        if (now - last_read > transport.read_gap_max_us) transport.read_gap_max_us = now - last_read;
+        last_read = now;
+        poll_uart_events();
+        size_t buffered = 0;
+        ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM_1, &buffered));
+        if (buffered > transport.rx_peak) transport.rx_peak = buffered;
+        int n = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(10));
+        if (n < 0) { ++transport.read_errors; transport_discontinuity(); }
+        else transport.bytes += (uint32_t)n;
+        if (poll_uart_events() && n > 0) {
+            transport.recovery_discarded_bytes += (uint32_t)n;
+            n = 0;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (desk_feed_rx(&incoming_from_controller, rx_buf[i], &ev)) handle_rx(&ev);
+        }
+        now = esp_timer_get_time();
+        bool was_moving = desk.moving;
+        desk_tracking_tick(&desk, now);
+        if (was_moving != desk.moving) {
+            log_record_t r = {.kind = LOG_CHANGE, .state = desk, .motion_changed = true};
+            enqueue_log(&r);
+        }
         if (now - last_report >= 5000000) {
-            const bool fresh = desk.height_known && (now - desk.last_rx_us < 1000000);
-            char height_text[16];
-            if (desk.height_known) {
-                snprintf(height_text, sizeof(height_text), "%u cm", (unsigned)desk.height_cm);
-            } else {
-                snprintf(height_text, sizeof(height_text), "unknown");
-            }
-            char command_text[8];
-            if (desk.height_known) {
-                snprintf(command_text, sizeof(command_text), "0x%02X",
-                         (unsigned)desk.controller_button);
-            } else {
-                snprintf(command_text, sizeof(command_text), "unknown");
-            }
-            ESP_LOGI(TAG, "STATUS height=%s ctrl_command=%s | RX AA+state=%lu invalid=%lu skipped=%lu | "
-                          "anomalies=%lu RX live=%s",
-                     height_text,
-                     command_text,
-                     (unsigned long)incoming_from_controller.good,
-                     (unsigned long)incoming_from_controller.invalid,
-                     (unsigned long)incoming_from_controller.skipped,
-                     (unsigned long)diagnostics.anomalies,
-                     fresh ? "yes" : "no (stale)");
+            log_record_t r = {.kind = LOG_STATUS, .state = desk, .parser = incoming_from_controller,
+                              .transport = transport, .anomalies = diagnostics.anomalies};
+            enqueue_log(&r);
             last_report = now;
         }
         vTaskDelay(pdMS_TO_TICKS(1));

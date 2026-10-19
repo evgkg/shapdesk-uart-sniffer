@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Provisional desk-specific plausibility limits, not proven travel limits.
+#define DESK_DISPLAY_MIN_CM 50
+#define DESK_DISPLAY_MAX_CM 150
+
 // Parsing is byte-oriented; no ESP-IDF dependencies, so it can be tested on a PC.
 typedef enum {
     DESK_EVENT_NONE = 0,
@@ -29,9 +33,17 @@ typedef struct {
     uint32_t good;
     uint32_t invalid;
     uint32_t skipped;
+    uint32_t decode_errors; // invalid AA/BB/D8 or parser capacity recovery
+    uint32_t invalid_state; // valid AA followed by an implausible STATE
+    uint32_t state_pair_errors;
+    uint32_t state_scan_errors;
+    uint32_t state_height_errors;
+    uint8_t last_rejected_state[6];
 } desk_parser_t;
 
 void desk_parser_reset(desk_parser_t *parser);
+// Discard partial bytes after transport loss, preserving cumulative counters.
+void desk_parser_discard_partial(desk_parser_t *parser);
 // Each feed returns at most one event. Separate parsers per physical UART.
 bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event);
 bool desk_feed_tx(desk_parser_t *parser, uint8_t byte, desk_event_t *event);
