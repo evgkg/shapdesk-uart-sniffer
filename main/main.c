@@ -11,45 +11,23 @@
 
 #include "desk_protocol.h"
 
-// These two GPIOs are INPUTS ONLY in this application. No desk TX drive.
-// Change them here if GPIO4/GPIO5 aren't exposed on your ESP32-S3 board.
-#define DESK_BOARD_RX_GPIO 4  // Shapdesk board pad RX (yellow) -> ESP32 GPIO4
-#define DESK_BOARD_TX_GPIO 5  // Shapdesk board pad TX (light blue) -> ESP32 GPIO5
+// Receive-only desk tap. Native USB Serial/JTAG uses GPIO18/19 on ESP32-C3.
+#define DESK_BOARD_RX_GPIO 4  // Shapdesk pad RX (yellow), through safe level translation
 #define DESK_BAUD          9600
 
 static const char *TAG = "shapdesk";
 static desk_parser_t incoming_from_controller;
-static desk_parser_t outgoing_from_panel;
 
 typedef struct {
     bool height_known;
     uint8_t height_cm;
     uint16_t controller_position;
-    uint16_t panel_position;
-    uint8_t panel_button;
-    bool button_known;
     uint8_t controller_button;
     uint8_t scan_code;
     uint8_t mode;
     int64_t last_rx_us;
-    int64_t last_tx_us;
 } desk_state_t;
 static desk_state_t desk;
-
-static const char *button_name(uint8_t v) {
-    switch (v) {
-        case 0x00: return "RELEASED";
-        case 0x01: return "DOWN";
-        case 0x02: return "UP";
-        case 0x04: return "PRESET_1?";
-        case 0x08: return "PRESET_2?";
-        case 0x10: return "PRESET_3?";
-        case 0x20: return "PRESET_4?";
-        case 0x40: return "MEMORY?";
-        case 0x80: return "SLEEP?";
-        default: return "UNKNOWN";
-    }
-}
 
 static void handle_rx(const desk_event_t *ev) {
     desk.last_rx_us = esp_timer_get_time();
@@ -64,20 +42,6 @@ static void handle_rx(const desk_event_t *ev) {
         ESP_LOGI(TAG, "HEIGHT %u cm | raw=%u | ctrl_command=0x%02X | mode=0x%02X",
                  (unsigned)ev->height_cm, (unsigned)ev->position_raw,
                  (unsigned)ev->button, (unsigned)ev->mode);
-    }
-}
-
-static void handle_tx(const desk_event_t *ev) {
-    desk.last_tx_us = esp_timer_get_time();
-    if (ev->type == DESK_EVENT_TX_POS) {
-        desk.panel_position = ev->position_raw;
-        return;
-    }
-    if (!desk.button_known || desk.panel_button != ev->button) {
-        desk.panel_button = ev->button;
-        desk.button_known = true;
-        ESP_LOGI(TAG, "PANEL BUTTON %s (0x%02X)",
-                 button_name(ev->button), (unsigned)ev->button);
     }
 }
 
@@ -98,11 +62,9 @@ static void init_uart_rx_only(uart_port_t port, int gpio) {
 
 void app_main(void) {
     desk_parser_reset(&incoming_from_controller);
-    desk_parser_reset(&outgoing_from_panel);
     init_uart_rx_only(UART_NUM_1, DESK_BOARD_RX_GPIO);
-    init_uart_rx_only(UART_NUM_2, DESK_BOARD_TX_GPIO);
-    ESP_LOGI(TAG, "PASSIVE SNIFFER: 9600 8N1, desk RX -> GPIO%d, desk TX -> GPIO%d",
-             DESK_BOARD_RX_GPIO, DESK_BOARD_TX_GPIO);
+    ESP_LOGI(TAG, "PASSIVE SNIFFER: 9600 8N1, desk RX -> UART1 GPIO%d",
+             DESK_BOARD_RX_GPIO);
     ESP_LOGW(TAG, "Listen-only. NEVER attach desk UART directly to ESP32 GPIO without safe level shifting.");
 
     uint8_t rx_buf[256];
@@ -115,12 +77,6 @@ void app_main(void) {
                 handle_rx(&ev);
             }
         }
-        n = uart_read_bytes(UART_NUM_2, rx_buf, sizeof(rx_buf), 0);
-        for (int i = 0; i < n; ++i) {
-            if (desk_feed_tx(&outgoing_from_panel, rx_buf[i], &ev)) {
-                handle_tx(&ev);
-            }
-        }
         int64_t now = esp_timer_get_time();
         if (now - last_report >= 5000000) {
             const bool fresh = desk.height_known && (now - desk.last_rx_us < 1000000);
@@ -131,13 +87,10 @@ void app_main(void) {
                 snprintf(height_text, sizeof(height_text), "unknown");
             }
             ESP_LOGI(TAG, "STATUS height=%s | RX AA+state=%lu invalid=%lu | "
-                          "TX BB+D8=%lu invalid=%lu | panel_button=%s | RX live=%s",
+                          "RX live=%s",
                      height_text,
                      (unsigned long)incoming_from_controller.good,
                      (unsigned long)incoming_from_controller.invalid,
-                     (unsigned long)outgoing_from_panel.good,
-                     (unsigned long)outgoing_from_panel.invalid,
-                     desk.button_known ? button_name(desk.panel_button) : "?",
                      fresh ? "yes" : "no (stale)");
             last_report = now;
         }

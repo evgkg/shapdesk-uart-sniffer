@@ -91,3 +91,18 @@ Use their code and documentation only after checking their licenses and comparin
 ## Update protocol
 
 After each substantial implementation/experiment, append a concise **dated** note here with: verified result, evidence (capture or command output), changed files, remaining unknowns. Keep `PROTOCOL.md` as the technical packet reference. Avoid pasting the entire chat or long build logs.
+
+## 2026-10-19 ? ESP32-C3 single-line adaptation
+
+- Observed in this checkout: local configuration already selected `esp32c3`, but `main/main.c` still initialized S3-style UART1 and UART2. Removed the second UART, panel state handling and TX-line logs. Only UART1 RX on GPIO4 at 9600 8N1 is initialized; no desk TX pin is assigned and no commands are sent.
+- Preserved `desk_protocol.c/.h` unchanged, including byte-stream AA checksum validation, the following six-byte duplicated-pair state group, height decoding and resynchronization. Offline BB/D8 parser support remains available; this firmware does not monitor the handset TX line.
+- Added the C3 default target in `CMakeLists.txt` and native USB Serial/JTAG console defaults in `sdkconfig.defaults`; updated local ignored `sdkconfig` and README wiring/build/log instructions. Native USB reserves GPIO18/19; actual board connector wiring and live console output remain unverified.
+- Observed: installed EIM PowerShell profile provides ESP-IDF v6.1. Standalone export could not resolve this EIM tool layout. With the installed profile, `idf.py build` reached CMake launch but failed with sandbox `PermissionError: [WinError 5]` creating a subprocess pipe. The request to run outside the sandbox was rejected by the user. C3 compile/link, live USB logs and desk decoding are therefore still unverified; no flash or UART transmission was performed.
+- Next: run `idf.py build` in the installed ESP-IDF 6.1 terminal, resolve any actual compiler errors, then request explicit approval before flashing. Confirm USB wiring and electrical interface before hardware validation.
+
+## 2026-10-19 ? User-provided C3 build and device log
+
+- Observed in the user's subsequent VS Code ESP-IDF 6.1 output: target `esp32c3`, successful application link and image generation, `shapdesk_uart_sniffer.bin` size `0x29d20` bytes, 84% app partition free. This supersedes the earlier unverified compilation status.
+- Device detection on COM3 reports ESP32-C3 revision v0.4, embedded 4 MB flash and native USB Serial/JTAG. No device identifiers are retained here.
+- The extension reports `Flash Done`, but detailed flash write/verification output is absent from the supplied text. No runtime monitor output was supplied; successful boot, USB application logs and live desk decoding remain unverified. The agent did not flash or send UART commands.
+- Kconfig and component dependency warnings shown originate in ESP-IDF components and did not prevent this build. Next verification: inspect ESP-IDF Monitor output for the passive sniffer startup and five-second STATUS logs.
