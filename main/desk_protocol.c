@@ -2,8 +2,8 @@
 
 #include <string.h>
 
-uint8_t desk_aa_checksum(const uint8_t aa[7]) {
-    return (uint8_t)(aa[1] + aa[2] + aa[3] + aa[4]);
+uint16_t desk_aa_checksum(const uint8_t aa[7]) {
+    return (uint16_t)aa[1] + aa[2] + aa[3] + aa[4];
 }
 
 const char *desk_reject_reason_name(desk_reject_reason_t reason) {
@@ -88,8 +88,9 @@ bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
         parser->desync_active = false;
         if (parser->len < 7) return false;
         const uint8_t *aa = parser->buf;
-        const uint8_t checksum = desk_aa_checksum(aa);
-        if (aa[1] != 0x09 || checksum != aa[6]) {
+        const uint16_t checksum = desk_aa_checksum(aa);
+        const uint16_t received = ((uint16_t)aa[5] << 8) | aa[6];
+        if (aa[1] != 0x09 || checksum != received) {
             record_reject(parser, aa[1] != 0x09 ? DESK_REJECT_AA_HEADER : DESK_REJECT_AA_CHECKSUM, 0);
             discard_prefix(parser, 1);
             ++parser->invalid;
@@ -121,7 +122,7 @@ bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event) {
             .position_raw = (uint16_t)((parser->buf[2] << 8) | parser->buf[3]),
             .height_cm = s[4],
             .button = parser->buf[4],
-            .aa_byte5 = parser->buf[5],
+            .aa_checksum = received,
             .scan_code = s[0],
             .mode = s[2],
         };

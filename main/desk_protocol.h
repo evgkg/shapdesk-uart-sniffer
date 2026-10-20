@@ -22,7 +22,7 @@ typedef struct {
     uint8_t height_cm;     // displayed cm; may transiently differ from physical height
     uint8_t button;        // DESK_EVENT_TX_BUTTON, or AA byte[4] for RX_STATE
     uint8_t scan_code;     // repeated first two bytes of RX state group
-    uint8_t aa_byte5;      // AA offset 5; unknown purpose, excluded from checksum
+    uint16_t aa_checksum;  // AA offsets 5..6, big-endian checksum
     uint8_t mode;          // repeated middle two bytes of RX state group
     uint8_t aa[7];         // exact validated RX bytes, not reconstructed
     uint8_t state[6];
@@ -75,8 +75,8 @@ void desk_parser_reset(desk_parser_t *parser);
 // Discard partial bytes after transport loss, preserving cumulative counters.
 void desk_parser_discard_partial(desk_parser_t *parser);
 const char *desk_reject_reason_name(desk_reject_reason_t reason);
-// Sum AA offsets 1..4 modulo 256; offset 5 is an independent unknown field.
-uint8_t desk_aa_checksum(const uint8_t aa[7]);
+// Full sum of AA offsets 1..4; transmitted big-endian at offsets 5..6.
+uint16_t desk_aa_checksum(const uint8_t aa[7]);
 // Each feed returns at most one event. Separate parsers per physical UART.
 bool desk_feed_rx(desk_parser_t *parser, uint8_t byte, desk_event_t *event);
 bool desk_feed_tx(desk_parser_t *parser, uint8_t byte, desk_event_t *event);

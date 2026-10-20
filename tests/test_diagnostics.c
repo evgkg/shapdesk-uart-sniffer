@@ -20,7 +20,9 @@ static desk_event_t parse(desk_parser_t *parser, unsigned raw, unsigned height,
     uint8_t bytes[] = {0xAA, 0x09, (uint8_t)(raw >> 8), (uint8_t)raw,
                        command, 0x00, 0, scan, scan, mode, mode,
                        (uint8_t)height, (uint8_t)height};
-    for (unsigned i = 1; i <= 5; ++i) bytes[6] += bytes[i];
+    uint16_t sum = (uint16_t)bytes[1] + bytes[2] + bytes[3] + bytes[4];
+    bytes[5] = (uint8_t)(sum >> 8);
+    bytes[6] = (uint8_t)sum;
     desk_event_t event = {0};
     // Every byte is a separate feed: state must survive arbitrary read boundaries.
     for (unsigned i = 0; i < sizeof(bytes); ++i) {

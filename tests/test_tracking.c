@@ -8,7 +8,9 @@ static bool feed(desk_parser_t *p, desk_tracking_t *s, unsigned raw, unsigned he
                  uint8_t command, uint8_t scan, int64_t now) {
     uint8_t bytes[] = {0xAA, 0x09, (uint8_t)(raw >> 8), (uint8_t)raw, command, 0, 0,
                       scan, scan, 3, 3, (uint8_t)height, (uint8_t)height};
-    for (unsigned i = 1; i <= 5; ++i) bytes[6] += bytes[i];
+    uint16_t sum = (uint16_t)bytes[1] + bytes[2] + bytes[3] + bytes[4];
+    bytes[5] = (uint8_t)(sum >> 8);
+    bytes[6] = (uint8_t)sum;
     desk_event_t event = {0};
     bool got = false;
     for (unsigned i = 0; i < sizeof(bytes); ++i) {

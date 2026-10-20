@@ -6,6 +6,8 @@ Last consolidated from the ChatGPT conversation on **2026-10-19**. This file is 
 
 Create an **unofficial, open-source** ESP-based Wi-Fi/Home Assistant integration for a height-adjustable Shapdesk, keeping physical buttons, stock motor controller and safety behavior. Prefer digital UART integration over soldering switches in parallel. Immediate milestone: passively monitor traffic and reliably parse height and handset actions.
 
+Current scope update (2026-10-20): the owner explicitly authorized bounded GPIO5 emulation of the physical UP contact over USB commands. UART remains strictly receive-only; earlier read-only-only milestones below are historical. No Wi-Fi/MQTT/HA or device flashing is authorized in this implementation task.
+
 ## Physical setup and tools
 
 - Desk handset: 3-digit display, seven buttons (up/down, memory presets 1–4, M), separate MCU, cable to desk control unit.
@@ -53,7 +55,7 @@ AA 09 12 B6 00 00 D1    60 60 03 03 4D 4D
 AA 09 14 BD 00 00 DA    62 62 00 00 5A 5A
 ```
 
-- Historical AA examples match the sum of bytes at offsets 1..5 modulo 256, but offset 5 was zero and its inclusion was not distinguishable. New `AA 09 11 E6 02 01 02` and the subsequent 1227-AA experiment confirm offsets 1..4. Offset 5 is excluded from checksum; its meaning remains unknown. See the checksum fix update below.
+- Current AA checksum: full uint16 sum of offsets 1..4, transmitted big-endian in offsets 5..6. Examples 0100/0102 identify offset 5 as the high checksum byte. Earlier eight-bit/unknown-byte interpretations in the dated history below are superseded by the latest 16-bit update.
 - Two-byte field in `AA` (e.g. `12 B6`) changes with position. The button/activity field (e.g. `00` vs `02`) changes during up; more mapping needed.
 - A **separate six-byte group** follows, whose first duplicated byte can cycle among `60,61,62,63,64,65,66,67,98`; purpose unknown. The duplicated middle byte (`00` / `03`) changes with state; do not call it simply 'motor moving' without confirmation.
 - Last duplicated state byte directly matches display centimetres in observed captures: `43 43` (67), `4D 4D` (77), `5A 5A` (90). A capture raising from ~67 cm ended with exactly **77** on the physical display; another at **90** yielded stable `5A 5A`. This is the strongest confirmed decoding result.
@@ -91,6 +93,16 @@ Use their code and documentation only after checking their licenses and comparin
 ## Update protocol
 
 After each substantial implementation/experiment, append a concise **dated** note here with: verified result, evidence (capture or command output), changed files, remaining unknowns. Keep `PROTOCOL.md` as the technical packet reference. Avoid pasting the entire chat or long build logs.
+
+## 2026-10-20 — Bounded physical UP emulation over USB
+
+- Owner-reported hardware: GPIO5 through 4.7k to 2N3904 base, base to GND through 100k; collector UP CH2, emitter UP CH1. HIGH presses, LOW releases. Owner physically verified raising/waking with this circuit; the agent has not tested hardware, isolation or timing.
+- Added desk_button_logic.c/.h (strict bounded command framing and portable press/deadline policy), desk_button.c/.h (GPIO5 initialization, independent GPTimer ISR, USB reader, bounded event logging), tests/test_button.c. Integrated with main.c, component dependencies and sdkconfig.defaults. Parser, height/preset/motion logic and UART1 RX GPIO4 are unchanged; no desk UART TX exists.
+- Commands: up 50..1000 ms, stop, status. Initial latch LOW precedes output enable; no automatic press at boot/reconnect. Only one active press, busy UP cannot extend deadline. Hardware timer checks absolute expiry every 1 ms, sets LOW before queuing logs, using IRAM/cache-safe code. Runtime tick quantization and ISR latency still need measurement. This is independent of command/log task progress, not a physical guarantee under total interrupt/CPU/electrical failure.
+- Safety guards: valid AA+STATE silence >=500 ms (500 ms grace from press start) or UART transport error releases; USB host SOF loss releases when command task detects it. A long wake press can end early if RX stays silent. Closing a terminal alone may retain USB connection; timeout remains effective. stop releases only the emulated UP contact, not physical buttons or stock automatic presets.
+- USB command task yields under flood and never prints synchronously. Existing logger drains button-event queue, reports begin/end reasons and loss count. Main owns desk snapshots; status requests use task notification. Shutdown handler releases on normal software reset; external base pulldown is relied on before application startup/during reset.
+- Verified: ESP-IDF v6.1 esp32c3 idf.py build succeeded (exit 0), image 0x2FF00 (196352) bytes, app partition 81% free. Both GPTIMER_ISR_CACHE_SAFE and GPIO_CTRL_FUNC_IN_IRAM enabled in defaults and local ignored config; build fails if absent. ELF symbol inspection places guard_alarm, desk_button_policy_tick, gpio_set_level, esp_timer_get_time and ISR queue send in IRAM, policy in DRAM.
+- Tests added for input framing/overflow/control characters, command bounds, busy non-extension, timeout and RX watchdog. Portable C11 strict syntax checks passed; test execution remains unverified because installed ESP clang only supports RISC-V/Xtensa and no native host compiler has been established. No flash, COM-port access, motor movement, wiring change or UART transmission performed by agent. Next: operator manual verification per README (boot LOW, short pulse, stop/busy, errors and continued UART reception).
 
 ## 2026-10-19 — AA sixth-byte checksum hypothesis
 
@@ -145,3 +157,23 @@ After each substantial implementation/experiment, append a concise **dated** not
 - Parser now uses only corrected desk_aa_checksum. Offset 5 is exposed as aa_byte5 with unknown semantics and retained in raw AA; DIAG logs it. Removed temporary two-formula helpers, external histogram, AA_SUM/AA_SUM_BYTE5 snapshots and logs. Bounded refusal logs retain one calculated checksum. Height/preset/motion modules are unchanged.
 - Replaced tests/test_checksum.c with acceptance tests for byte5=00/01 (exact reported AA plus synthetic STATE), all 256 unknown-field values, modulo wrap, refusal of the old sum, recovery and unchanged STATE validation. Strict C11 syntax checks pass for portable code and five test sources; tests were not executed on a host CPU.
 - Observed: idf.py build succeeded (exit 0, Project build complete), ESP-IDF v6.1, esp32c3, after approved outside-sandbox run. Binary build/shapdesk_uart_sniffer.bin is 0x2BD00 (179456) bytes; app partition 83% free. No flashing or UART transmission performed; new binary runtime remains to be checked.
+
+## 2026-10-19 - Full 16-bit AA checksum
+
+- New user-provided AA examples: AA 09 11 E4 02 01 00 => 0100; AA 09 11 E6 02 01 02 => 0102; AA 09 16 CC 00 00 EB => 00EB. These identify offsets 5..6 as big-endian uint16 checksum, correcting the earlier unknown-byte and low-byte-only interpretations. The 1227-packet diagnostic established the sum operands but did not independently validate the high byte.
+- desk_protocol.c/.h now compare the full uint16 sum of offsets 1..4 with offsets 5..6. Removed aa_byte5; accepted events retain aa_checksum plus exact raw AA. main.c DIAG and bounded REJECT_AA logs use four-digit checksums. Temporary AA_SUM statistics were already removed and remain absent. Rejection counters, STATE validation and byte-wise resynchronization are unchanged; height/preset/motion modules and GPIO are untouched.
+- Updated tests/test_checksum.c with 00EB/0100/0102, high/low byte corruption, recovery, old correct frames and 0306 (no truncation). Synthetic STATE accompanies the new observed seven-byte AA samples. Strict portable C11 syntax checks pass; tests not executed because no native host C compiler was found. Test data generators in test_diagnostics.c and test_tracking.c now encode full big-endian checksum. No UART transmission or flashing.
+
+- Verification for the 16-bit change: idf.py build completed successfully (exit 0) on ESP-IDF v6.1, esp32c3; image 0x2BD10 (179472) bytes, 83% app partition free. Strict C11 syntax checks pass for portable sources and all five test sources. Runtime test execution remains unverified; no native compiler was found in the inspected MSYS2/LLVM/Visual Studio locations. No device was flashed.
+
+## 2026-10-20 - UP duration extended to 5 seconds
+
+- User explicitly requested up 5000. Raised DESK_UP_MAX_MS from 1000 to 5000; command help and README reflect 50..5000 ms. Existing stop, busy non-extension, GPTimer expiry, USB/UART fault and 500 ms RX silence guards unchanged. No GPIO/protocol/tracking changes.
+- Added test cases accepting 1001/5000, rejecting 5001, exercising the five-second deadline with continuing valid RX and early RX-loss release. Strict portable C11 syntax check passes; unit test execution remains unverified on this host.
+- idf.py build succeeded for ESP32-C3 with ESP-IDF v6.1 (exit 0); binary 0x2FF00 bytes, app partition 81% free. No flash or movement performed. New firmware must be flashed by the operator before up 5000 is available.
+
+## 2026-10-20 - Temporary button-only test mode
+
+- Observed user log: up 5000 begins at 78454204 us and releases at 78954543 us (about 500 ms), reason RX loss; UART bytes/good both zero. User explicitly requested removing UART feedback dependence while testing only the physical button.
+- Added DESK_UP_REQUIRE_UART_FEEDBACK, default 0, in desk_button_logic.h. Disabled RX-silence expiry and UART-error-triggered button release in this mode; set to 1 and rebuild to restore both interlocks. Sniffer/error statistics continue independently. Absolute 5-second deadline, stop, USB loss, boot LOW and busy non-extension remain active. README and boot log identify the mode; no GPIO or protocol changes.
+- Expanded policy tests for five seconds with no RX; strict syntax checks pass with feedback disabled and enabled. Tests not executed on host. ESP-IDF v6.1 esp32c3 build succeeded (exit 0), image 0x2FF50 bytes, 81% app partition free. No flashing or movement performed; operator needs to flash this binary to remove the observed RX cutoff.

@@ -1,6 +1,60 @@
 # Shapdesk UART sniffer (ESP32-C3 / ESP-IDF)
 
-**Experimental, unofficial, read-only firmware.** Tested at the protocol-parser level against observed Shapdesk UART bytes, **not tested on the actual desk/ESP32 hardware yet**. Configured for ESP-IDF 6.1 (target `esp32c3`). A subsequent user-provided VS Code ESP-IDF log confirms a successful ESP32-C3 build; live firmware operation remains unverified. No Wi-Fi, no motor movement, no commands transmitted.
+**Experimental, unofficial firmware: passive UART monitoring plus bounded UP-button emulation.** ESP32-C3 / ESP-IDF 6.1. Explicit USB `up` commands can move the desk using GPIO5 and the stock handset's UP contact. UART remains receive-only; no Wi-Fi or UART commands. The new control firmware has compiled but has not been flashed or physically tested by the agent.
+
+## UP contact and USB commands
+
+The owner reports this circuit physically tested, including wake from sleep:
+
+```text
+GPIO5 -- 4.7 kOhm -- 2N3904 base -- 100 kOhm -- GND
+2N3904 collector -> handset UP CH2
+2N3904 emitter   -> handset UP CH1
+```
+
+HIGH presses UP, LOW releases the electronic contact. This is separate from the UART wiring below. Preserve stock buttons and controller protections. `stop` releases only the emulated contact: it cannot override a physically held button or guarantee stopping a stock automatic preset.
+
+Commands are case-sensitive; terminate with Enter (CR/LF/CRLF). There is no input echo/line editor. Control characters, including backspace, invalidate that line: submit it and retype.
+
+| Command | Behavior |
+|---|---|
+| `up 300` | Press for nominally 300 ms, then automatically release |
+| `up 5000` | Press for up to 5 seconds, then release (guards may release earlier) |
+| `up 50` / `up 5000` | Inclusive duration boundaries (50 ms to 5 seconds) |
+| `stop` | Immediately release when this received line is processed; safe when idle |
+| `status` | Existing desk/parser/UART summary plus GPIO5 level, active state, remaining time and dropped button-log count |
+
+Invalid durations, signs, extra arguments, unknown commands and lines longer than 31 bytes are rejected. A second `up` during a press is rejected as busy without extending its deadline. No movement is queued or generated on boot/reconnect.
+
+GPIO5's output latch is LOW before output is enabled, as the first application initialization step. The external 100 kOhm pulldown holds the base off before app_main/during reset. A normal software restart also invokes a release handler.
+
+A GPTimer ISR checks the absolute deadline every 1 ms and sets GPIO5 LOW before queuing an end log, independently of USB reads, command processing and log printing. Cache-safe GPTimer and IRAM GPIO functions are mandatory build settings. Timing has 1 ms quantization plus interrupt latency; pulse width and reset behavior require hardware verification. Software cannot guarantee release during total CPU/interrupt failure or transistor/electrical failure; a hard bound under those faults requires an external hardware one-shot/watchdog.
+
+**Current button-only test mode:** UART feedback interlocks are disabled at the owner's request (`DESK_UP_REQUIRE_UART_FEEDBACK=0` in `desk_button_logic.h`). No RX bytes or UART errors will shorten `up 5000`; the sniffer and its error counters continue operating independently. Set the switch to 1 and rebuild to restore release on 500 ms valid-RX silence (with initial wake grace) and UART transport errors. This bench mode provides no desk-feedback interlock. USB disconnect release, `stop`, the 5-second absolute deadline, busy-command rejection and boot LOW remain active. Closing only the serial terminal may leave USB SOF packets present; the deadline remains effective.
+
+USB input runs in its own task, yields under command floods, and does not block UART RX. `status` notifies the UART owner to take the existing snapshot. Button events use a bounded nonblocking queue consumed by the existing logger; dropped logs are counted, and release does not depend on logging.
+
+## Operator build, flash and manual check
+
+From the installed **ESP-IDF 6.1 PowerShell**, in the repository root:
+
+```powershell
+idf.py set-target esp32c3
+idf.py build
+idf.py -p COM3 flash
+idf.py -p COM3 monitor
+```
+
+`COM3` is the previously detected native USB Serial/JTAG port; replace it if it changed. Close other monitors before flashing. Flash commands above are **operator instructions**, not actions executed by the agent.
+
+1. Before UP, verify no motion on boot/reset. Enter `status`; expect `BUTTON GPIO5=0 active=no`.
+2. Enter `up 49`, `up 5001`, `up -300`, `up 300 extra` separately: rejection, no movement.
+3. With travel clearance and the handset accessible, enter `up 300`: expect `UP BEGIN ... duration=300`, then `UP END ... reason=timeout`. Confirm physical release and GPIO5=0 through `status`.
+4. Enter `up 1000`, promptly another `up 300`, then `stop`: the second UP is busy, stop releases early. Use a terminal capable of sending prepared whole lines if typing is too slow.
+5. In the current button-only mode, `up 5000` must release with `reason=timeout` after approximately 5 seconds even with UART bytes=0. If UART feedback is re-enabled, missing valid RX should instead cause early `RX loss`. Check UART/parser counters independently if the tap is connected.
+6. Verify release after closing the monitor. If separately testing cable loss with independent board power, expect disconnect detection or the original timeout; cable-powered boards release through power loss/pulldown. Do not change energized power/ground wiring.
+
+Exit monitor with **Ctrl+]**. New button control still needs physical validation. No automatic test movement runs after flashing.
 
 ## What it reads
 
@@ -14,11 +68,11 @@ The program logs display-height changes, `CTRL_COMMAND` independently on command
 
 `height_cm` follows the displayed value and may briefly differ from physical height during preset activation. Suspected jumps produce `DIAG BEFORE/ANOMALY/AFTER` lines with exact AA/state bytes and all decoded fields. The default heuristic is a height jump of at least 5 cm with raw-position change at most 32, with four preceding and four following valid messages. STATE must have three duplicated pairs, scan `0x60..0x67`/`0x98` and height 50..150 cm; this is a provisional acceptance policy, not measured travel limits. A PRESET_1 (`0x04`) display transient is retained as a candidate separately from the last plausible physical height. Motion uses raw-position changes independently of command. See PROTOCOL.md sections 3.4–3.6 for limits and counters.
 
-UART reception uses an 8192-byte ring and 64-event queue; USB logs go through a separate 64-record queue. Watch `fifo_overflow`, `ring_full`, `frame`, `rx_peak`, `event_peak`, `log_dropped` and `log_max_us` when investigating errors during movement. New transport errors discard partial input and invalidate physical certainty. The corrected checksum version built successfully for ESP32-C3 with ESP-IDF 6.1 on 2026-10-19: binary `0x2BD00` bytes, 83% app partition free. It has not been flashed by the agent; new diagnostics still require runtime verification.
+UART reception uses an 8192-byte ring and 64-event queue; USB logs go through a separate 64-record queue. Watch `fifo_overflow`, `ring_full`, `frame`, `rx_peak`, `event_peak`, `log_dropped` and `log_max_us` when investigating errors during movement. New transport errors discard partial input and invalidate physical certainty. The corrected checksum version built successfully for ESP32-C3 with ESP-IDF 6.1 on 2026-10-19: binary `0x2BD10` bytes, 83% app partition free. It has not been flashed by the agent; new diagnostics still require runtime verification.
 
 `REJECT_COUNTS` distinguishes AA header/checksum refusal, STATE validation, desynchronization runs, internal capacity recovery, offline TX validation and transport partial discards. `REJECT_SAMPLE` prints only the first observed context per reason (up to 13 bytes), at most once while incomplete and once when closed. Samples preserve decision length, stream offset and STATE policy flags; later errors update statistics without replacing samples. Unknown scans remain rejected by the existing provisional policy, but are **not established protocol errors**. See PROTOCOL.md section 3.7 for interpreting `decode_errors` and the 12 skipped bytes after an AA refusal.
 
-AA checksum is the sum of byte indices **1-4 modulo 256**, excluding byte 5. The owner reports all 1227 AA matching this formula; including byte 5 rejected 62 valid examples. Byte 5 is exposed as `aa_byte5`, with unknown purpose, and retained in raw AA/DIAG. Temporary comparison statistics were removed; bounded `REJECT_AA` logs retain the corrected calculated checksum. See PROTOCOL.md section 3.1.
+AA checksum is the full **16-bit sum of byte indices 1-4**, transmitted **big-endian in bytes 5-6**. Byte 5 is the high checksum byte, not an unknown flag. `AA 09 11 E4 02 01 00` and `AA 09 11 E6 02 01 02` carry sums `0x0100` and `0x0102`. Parsed events/DIAG expose `aa_checksum`; raw AA bytes are preserved. `REJECT_AA` shows full received/calculated sums. Temporary `AA_SUM` comparison statistics are removed. See PROTOCOL.md section 3.1.
 
 ## Wiring — important safety prerequisites
 
@@ -87,6 +141,9 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic \
 cc -std=c11 -Wall -Wextra -Werror -pedantic \
   -I main main/desk_protocol.c tests/test_checksum.c -o test_checksum
 ./test_checksum
+cc -std=c11 -Wall -Wextra -Werror -pedantic \
+  -I main main/desk_button_logic.c tests/test_button.c -o test_button
+./test_button
 ```
 
 The parser is implemented in plain C, independent of ESP-IDF, and rejects frames with invalid checksums or broken duplicated pairs. After stream errors, it scans for the next start byte. `AA` (7 bytes) and status (6 bytes) are handled as one **13-byte parsing unit** because the real captures have them consecutively; this is a convenience for parsing, not an assertion that there is no gap between UART transmissions.

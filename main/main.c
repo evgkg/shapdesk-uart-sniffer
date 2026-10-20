@@ -14,6 +14,7 @@
 #include "desk_protocol.h"
 #include "desk_diagnostics.h"
 #include "desk_tracking.h"
+#include "desk_button.h"
 
 // Receive-only desk tap. Native USB Serial/JTAG uses GPIO18/19 on ESP32-C3.
 #define DESK_BOARD_RX_GPIO 4  // Shapdesk pad RX (yellow), through safe level translation
@@ -29,6 +30,9 @@ static desk_diagnostics_t diagnostics;
 static QueueHandle_t uart_events;
 static QueueHandle_t log_queue;
 static desk_tracking_t desk;
+static TaskHandle_t uart_owner;
+
+static void request_status(void) { xTaskNotifyGive(uart_owner); }
 
 typedef struct {
     uint32_t bytes, fifo_overflow, ring_full, frame_errors, parity_errors, breaks;
@@ -82,10 +86,10 @@ static void log_diagnostic(desk_diag_kind_t kind, const desk_diag_sample_t *samp
     const char *label = kind == DESK_DIAG_BEFORE ? "BEFORE" :
                         kind == DESK_DIAG_ANOMALY ? "ANOMALY" : "AFTER";
     ESP_LOGI(TAG, "DIAG %s seq=%" PRIu32 " rx_us=%" PRId64
-             " position_raw=%u height_cm=%u button=0x%02X aa_byte5=0x%02X scan_code=0x%02X mode=0x%02X"
+             " position_raw=%u height_cm=%u button=0x%02X aa_checksum=0x%04X scan_code=0x%02X mode=0x%02X"
              " | AA=[%s] STATE=[%s]", label, sample->sequence, sample->time_us,
              (unsigned)ev->position_raw, (unsigned)ev->height_cm,
-             (unsigned)ev->button, (unsigned)ev->aa_byte5, (unsigned)ev->scan_code, (unsigned)ev->mode, aa, state);
+             (unsigned)ev->button, (unsigned)ev->aa_checksum, (unsigned)ev->scan_code, (unsigned)ev->mode, aa, state);
 }
 
 static void log_task(void *ctx) {
@@ -95,7 +99,8 @@ static void log_task(void *ctx) {
     bool printed_prefix[DESK_REJECT_REASON_COUNT] = {0};
     bool printed_complete[DESK_REJECT_REASON_COUNT] = {0};
     while (true) {
-        if (xQueueReceive(log_queue, &r, portMAX_DELAY) != pdTRUE) continue;
+        desk_button_log_events();
+        if (xQueueReceive(log_queue, &r, pdMS_TO_TICKS(50)) != pdTRUE) continue;
         int64_t start = esp_timer_get_time();
         if (r.kind == LOG_DIAG) {
             log_diagnostic(r.diag_kind, &r.sample, NULL);
@@ -117,6 +122,9 @@ static void log_task(void *ctx) {
                     "HEIGHT display=%s current=%s held=%s preset_target_candidate=%s raw=%u",
                     display, current, s->current_held ? "yes" : "no", candidate, (unsigned)s->position_raw);
             } else {
+                desk_button_status_t button = desk_button_status();
+                ESP_LOGI(TAG, "BUTTON GPIO5=%d active=%s remaining_ms=%u event_log_dropped=%lu",
+                    button.gpio_level, button.active ? "yes" : "no", button.remaining_ms, (unsigned long)button.log_dropped);
                 ESP_LOGI(TAG, "STATUS display=%s current=%s held=%s preset_target_candidate=%s ctrl_command=%s"
                     " raw=%u moving=%s direction=%d RX_live=%s", display, current,
                     s->current_held ? "yes" : "no", candidate, command, (unsigned)s->position_raw,
@@ -151,8 +159,9 @@ static void log_task(void *ctx) {
                     if (sample->bytes[0] == 0xAA && sample->len >= 7) {
                         const uint8_t *a = sample->bytes;
                         unsigned sum = desk_aa_checksum(a);
-                        ESP_LOGI(TAG, "REJECT_AA header_byte=0x%02X expected_header=0x09 byte5=0x%02X checksum_seen=0x%02X calculated=0x%02X",
-                            (unsigned)a[1], (unsigned)a[5], (unsigned)a[6], sum);
+                        unsigned received = ((unsigned)a[5] << 8) | a[6];
+                        ESP_LOGI(TAG, "REJECT_AA header_byte=0x%02X expected_header=0x09 checksum_seen=0x%04X calculated=0x%04X",
+                            (unsigned)a[1], received, sum);
                     }
                     printed_prefix[i] = true;
                     if (sample->closed) printed_complete[i] = true;
@@ -185,6 +194,7 @@ static void log_task(void *ctx) {
 }
 
 static void handle_rx(const desk_event_t *ev) {
+    desk_button_uart_rx();
     int64_t now = esp_timer_get_time();
     desk_tracking_t prev = desk;
     desk_tracking_feed(&desk, ev, now);
@@ -198,6 +208,7 @@ static void handle_rx(const desk_event_t *ev) {
 }
 
 static void transport_discontinuity(void) {
+    desk_button_stop(DESK_RELEASE_UART_ERROR);
     desk_parser_discard_partial(&incoming_from_controller);
     desk_tracking_discontinuity(&desk);
     diagnostics.count = diagnostics.next = diagnostics.following = 0;
@@ -247,13 +258,16 @@ static void init_uart_rx_only(void) {
 }
 
 void app_main(void) {
+    ESP_ERROR_CHECK(desk_button_init());
+    uart_owner = xTaskGetCurrentTaskHandle();
     desk_parser_reset(&incoming_from_controller);
     log_queue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(log_record_t));
     ESP_ERROR_CHECK(log_queue ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(xTaskCreate(log_task, "desk_log", 6144, NULL, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_LOGI(TAG, "PASSIVE SNIFFER: 9600 8N1, desk RX -> UART1 GPIO%d", DESK_BOARD_RX_GPIO);
-    ESP_LOGW(TAG, "Listen-only. Use safe level translation and a verified ground interface.");
+    ESP_LOGW(TAG, "UART listen-only. GPIO5 UP emulation ready, released. Commands: up 50..5000, stop, status");
     init_uart_rx_only();
+    ESP_ERROR_CHECK(desk_button_console_start(request_status));
     uint8_t rx_buf[256];
     desk_event_t ev;
     int64_t last_report = esp_timer_get_time(), last_read = last_report;
@@ -282,7 +296,7 @@ void app_main(void) {
             log_record_t r = {.kind = LOG_CHANGE, .state = desk, .motion_changed = true};
             enqueue_log(&r);
         }
-        if (now - last_report >= 5000000) {
+        if (ulTaskNotifyTake(pdTRUE, 0) || now - last_report >= 5000000) {
             log_record_t r = {.kind = LOG_STATUS, .state = desk, .parser = incoming_from_controller,
                               .transport = transport, .anomalies = diagnostics.anomalies};
             enqueue_log(&r);
